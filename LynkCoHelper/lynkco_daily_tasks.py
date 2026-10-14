@@ -17,7 +17,7 @@ import time
 
 from lynkco_common import env_value, mask_sensitive
 from lynkco_login import load_token
-from lynkco_notify import build_markdown_report, send_bark_notification
+from lynkco_notify import build_markdown_report, build_title, send_bark_notification
 from lynkco_sign import LynkCoSignClient
 from lynkco_share import LynkCoShareClient
 
@@ -26,12 +26,29 @@ from lynkco_share import LynkCoShareClient
 ENERGY_REFRESH_DELAY_SECONDS = float(env_value("LYNKCO_ENERGY_DELAY", "5"))
 
 EP_MY_ENERGY = "/app/energy/myEnergy"
+# 能量体等级信息（余额 energyNum/等级 energyLevel/下一级门槛 nextEnergyNum），
+# 经真机抓包验证该路径可直接走 app-api-gw-toc 网关 + 原生签名调用。
+EP_ENERGY_GRADE = "/app/user/privilegePackage/energyGradeInfo"
+# 积分/能量体规则页 H5 地址（预留，暂未使用）。
+EP_RULE_LIST = "/app/rule/list"
 
 
 def get_my_energy(client: LynkCoSignClient) -> dict:
-    """查询当前账号的能量体积分（GET /app/energy/myEnergy，与签到共用同一网关/签名体系）。"""
+    """查询当前账号的 Co积分（GET /app/energy/myEnergy，与签到共用同一网关/签名体系）。"""
     resp = client._request("GET", EP_MY_ENERGY)
     return resp.json()
+
+
+def get_energy_grade(client: LynkCoSignClient) -> dict:
+    """查询当前账号的能量体余额与等级（GET /app/user/privilegePackage/energyGradeInfo）。"""
+    resp = client._request("GET", EP_ENERGY_GRADE)
+    return resp.json()
+
+
+def get_rule_urls(client: LynkCoSignClient) -> dict:
+    """查询积分/能量体规则页地址（GET /app/rule/list），失败时返回空字典。"""
+    resp = client._request("GET", EP_RULE_LIST)
+    return (resp.json().get("data") or {})
 
 
 def run_daily_tasks(token: str, do_share: bool = True) -> dict:
@@ -76,6 +93,19 @@ def run_daily_tasks(token: str, do_share: bool = True) -> dict:
         time.sleep(ENERGY_REFRESH_DELAY_SECONDS)
     result["energy_after"] = get_my_energy(sign_client)
 
+    # 能量体余额与等级（失败不影响主任务，置 None 后推送端自动省略）
+    try:
+        result["energy_grade"] = get_energy_grade(sign_client)
+    except Exception as e:
+        print(f"[警告] 能量体等级查询失败（不影响其他任务）: {e}")
+        result["energy_grade"] = None
+
+    # 规则页地址（供推送点击跳转，失败置空）
+    try:
+        result["rule_urls"] = get_rule_urls(sign_client)
+    except Exception:
+        result["rule_urls"] = {}
+
     return result
 
 
@@ -103,7 +133,7 @@ def run_and_notify() -> dict:
     icon = env_value("LYNKCO_BARK_ICON") or None
     try:
         notify_result = send_bark_notification(
-            title="领克App · 每日任务",
+            title=build_title(result),
             markdown_body=markdown_body,
             icon=icon,
         )
