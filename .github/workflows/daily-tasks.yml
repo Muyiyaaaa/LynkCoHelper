@@ -11,12 +11,9 @@
 name: LynkCoHelperRunner
 
 on:
-  schedule:
-    # 双时间点冗余调度：GitHub 的 cron 在高峰时段（UTC 午夜前后最拥堵）会
-    # 静默丢弃任务，实测单时间点连续多日不触发。挂两个 cron 提高命中率：
-    # 任务本身幂等（已签到自动跳过、分享有每日加分上限），一天跑两次无害。
-    - cron: "23 0 * * *"   # 北京时间 08:23（主时间点）
-    - cron: "41 2 * * *"   # 北京时间 10:41（冷门时段兜底，UTC 2-4 点调度压力最小）
+  # 仅手动/API 触发（workflow_dispatch）。GitHub 免费版的 cron 调度实测
+  # 延迟 2 小时以上且高峰时段静默丢弃，不可依赖，改由 iOS 快捷指令自动化
+  # 在每天固定时间调用 GitHub API 触发（token 仅授权本仓库 Actions 权限）。
   workflow_dispatch:
 
 jobs:
