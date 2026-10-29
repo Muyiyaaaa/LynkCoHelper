@@ -3,10 +3,14 @@
 # 提供，代码中不含任何默认值，未配置会直接报错退出，获取方式见 readme.md。
 # 说明：
 #   - 登录环节存在滑块验证码，无法在 CI 中完全自动化，本工作流依赖
-#     refreshToken 自动续期获取 token（约30天有效，需定期人工更新）。
+#     refreshToken 自动续期获取 token。
 #   - LYNKCO_APP_SECRETS 是领克官方 App 的应用级共用签名密钥集合
 #     （非个人账号凭证），一个 JSON 字符串 Secret 整合以下 4 个独立字段，
 #     必须配置，否则脚本无法计算请求签名。
+#   - refreshToken 为轮换制（每次续期发新值，旧值短时作废），Secrets 静态
+#     存不了轮换链：每次运行结束时把最新值用 nativeAppSecret 派生密钥
+#     AES-GCM 加密上传为 artifact（公开仓库亦安全），下次运行先恢复。
+#     Secrets 里的 LYNKCO_REFRESH_TOKEN 仅作冷启动种子。
 
 name: LynkCoHelperRunner
 
@@ -15,6 +19,10 @@ on:
   # 延迟 2 小时以上且高峰时段静默丢弃，不可依赖，改由 iOS 快捷指令自动化
   # 在每天固定时间调用 GitHub API 触发（token 仅授权本仓库 Actions 权限）。
   workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   daily-tasks:
@@ -32,9 +40,29 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ -f ./LynkCoHelper/requirements.txt ]; then pip install -r ./LynkCoHelper/requirements.txt; fi
+
+    - name: 恢复上次轮换后的 refreshToken（artifact 链）
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+      run: |
+        set -e
+        ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=refresh-state&per_page=1" --jq '.artifacts[0].id // empty' || true)
+        if [ -z "$ART_ID" ]; then
+          echo "[restore] 无历史 artifact（首次运行或已过期），将使用 Secrets 种子值"
+          exit 0
+        fi
+        echo "[restore] 下载 artifact #$ART_ID"
+        gh api "repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip" > rt.zip
+        unzip -o -j rt.zip -d rt_dir
+        python LynkCoHelper/tools/refresh_state.py restore rt_dir/rt.enc > .rt_restored
+        RT_LEN=$(wc -c < .rt_restored)
+        echo "[restore] 已恢复轮换后的 refreshToken（${RT_LEN} 字符）"
+
     - name: Run sign-in and notify
       env:
-        # refreshToken 自动续期获取 token，详见 lynkco_login.load_token()
+        # refreshToken 自动续期获取 token，详见 lynkco_login.load_token()。
+        # 优先使用上一步从 artifact 恢复的最新轮换值；无恢复文件时回退到 Secrets 种子。
         LYNKCO_REFRESH_TOKEN: ${{ secrets.LYNKCO_REFRESH_TOKEN }}
         LYNKCO_DEVICE_ID: ${{ secrets.LYNKCO_DEVICE_ID }}
         # Bark 推送 key，详见 lynkco_notify.py
@@ -49,4 +77,28 @@ jobs:
         LYNKCO_TIMEOUT: ${{ vars.LYNKCO_TIMEOUT || '30' }}
         LYNKCO_RETRIES: ${{ vars.LYNKCO_RETRIES || '2' }}
       run: |
+        if [ -s .rt_restored ]; then
+          export LYNKCO_REFRESH_TOKEN="$(cat .rt_restored)"
+          echo "[run] 使用 artifact 恢复的最新 refreshToken"
+        else
+          echo "[run] 使用 Secrets 种子 refreshToken"
+        fi
         python ./LynkCoHelper/lynkco_daily_tasks.py
+
+    - name: 持久化轮换后的 refreshToken
+      if: ${{ always() }}
+      env:
+        LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+      run: |
+        # 任务即使失败，只要续期成功过 env.json 就有新值；持久化失败不阻断通知
+        python LynkCoHelper/tools/refresh_state.py persist LynkCoHelper/env.json rt.enc \
+          && echo "[persist] OK" || echo "[persist] 跳过（本次未产生新 refreshToken）"
+
+    - name: 上传轮换状态 artifact
+      if: ${{ hashFiles('rt.enc') != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: refresh-state
+        path: rt.enc
+        retention-days: 90
+        overwrite: true
