@@ -11,9 +11,13 @@ do_share() 已封装好"优先简化两步法，失败/无 content_id 时可选�
 逻辑。通过 lynkco_sign.py / lynkco_daily_tasks.py 运行时会自动执行一次分享；
 也可直接运行本文件单独触发一次分享。
 """
+import base64
+import hashlib
+import hmac
 import json
 import sys
 import time
+import uuid
 
 import requests
 
@@ -339,6 +343,83 @@ def run_auto_share(token: str) -> dict:
         return {"ok": False, "detail": {"message": str(e)}}
 
 
+# ------------------------- H5 落地页浏览上报（互点加分的关键路径） -------------------------
+#
+# 分享任务（"分享热爱"）的完成条件是"当日首次分享内容且当日被浏览"。实测
+# （2026-10-31）：App 原生会话内的自分享上报与代上报（原生网关 appKey
+# 203760416 签名）服务端均不计为浏览，taskStatus 保持 0；只有分享落地页
+# （H5，app.lynkco.com/app-h5/...）打开时发出的匿名浏览上报才会计入。
+# 该 H5 请求走阿里云网关独立 appKey（204644386），HmacSHA256 签名密钥与
+# 拼装格式自 H5 前端 bundle（app-h5/dist/web/vendor.*.js 的 buildApiSigature）
+# 提取，并已用真实抓包请求逐字节验证签名一致。
+
+H5_GW_BASE_URL = "https://app-api-gw-toc.lynkco.com"
+H5_APP_KEY = "204644386"
+H5_APP_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX"
+H5_SHARE_PAGE_ORIGIN = "https://app.lynkco.com"
+H5_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 15_2 like Mac OS X) "
+         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.2 Mobile/15E148 Safari/604.1")
+
+
+def _h5_signed_headers(method: str, path_with_query: str,
+                       accept: str = "*/*",
+                       content_type: str = "application/json") -> dict:
+    """复刻 H5 bundle buildApiSigature：HmacSHA256(base64) over 固定五行 + 头 + 规范化路径。"""
+    timestamp = str(int(time.time() * 1000))
+    base = {
+        "X-Ca-Key": H5_APP_KEY,
+        "X-Ca-Nonce": str(uuid.uuid4()),
+        "X-Ca-Signature-Method": "HmacSHA256",
+        "X-Ca-Timestamp": timestamp,
+    }
+    # 与 JS 一致：[METHOD, Accept, "", Content-Type, ""] + 各签名头 K:V + 规范化 path?query
+    string_to_sign = "\n".join(
+        [method.upper(), accept, "", content_type, ""]
+        + [f"{k}:{v}" for k, v in base.items()]
+        + [path_with_query]
+    )
+    signature = base64.b64encode(
+        hmac.new(H5_APP_SECRET.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("ascii")
+    headers = dict(base)
+    headers.update({
+        "X-Ca-Signature-Headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
+        "X-Ca-Signature": signature,
+        "Accept": accept,
+        "Content-Type": content_type,
+        "User-Agent": H5_UA,
+        "Origin": H5_SHARE_PAGE_ORIGIN,
+        "Referer": H5_SHARE_PAGE_ORIGIN + "/",
+    })
+    return headers
+
+
+def h5_report_view(share_code: str, business_no: str = "",
+                   first_classification: str = "文章",
+                   second_classification: str = "") -> dict:
+    """
+    以 H5 落地页访客身份上报一次浏览（POST /app/v1/task/shareReporting?shareCode=...），
+    为分享人记一次"被浏览"。匿名调用（H5 网关签名），无需任何账号 token；
+    shareCode 由分享人侧 getShareCode 生成。
+    """
+    path = f"/app/v1/task/shareReporting?shareCode={share_code}"
+    body = {
+        "businessNo": business_no or "",
+        "eventData": {
+            "firstClassification": first_classification,
+            "secondClassification": second_classification,
+        },
+    }
+    resp = requests.post(
+        H5_GW_BASE_URL + path,
+        json=body,
+        headers=_h5_signed_headers("POST", path),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ------------------------- 双账号互点分享 -------------------------
 
 def _run_three_step_as_visitor(client: LynkCoShareClient, content_id: str,
@@ -417,8 +498,12 @@ def cross_share(token_a: str, token_b: str,
 
 def run_cross_share_for_accounts(accounts: list) -> dict:
     """
-    供 lynkco_daily_tasks.py 调用：取 load_accounts() 返回的前两个账号执行互点分享。
-    每个账号独立走 load_token_for() 续期；账号不足 2 个时返回 {"skipped": True}。
+    供 lynkco_daily_tasks.py 调用：取 load_accounts() 返回的前两个账号互为
+    "H5 访客"浏览对方的分享，使每个账号的"分享热爱"任务满足"当日被浏览"条件。
+    账号不足 2 个时返回 {"skipped": True}。
+
+    旧版三步法（lookup/check/report，App 原生签名）实测不会被服务端计为浏览，
+    已废弃；浏览上报走 h5_report_view（匿名 H5 网关签名，见其 docstring）。
     """
     if not accounts or len(accounts) < 2:
         print("[提示] 账号数量少于 2（需在 env.json 配置 users 数组），跳过互点分享。")
@@ -432,28 +517,49 @@ def run_cross_share_for_accounts(accounts: list) -> dict:
         tokens[label] = load_token_for(account, label=account.get("name"))
         device_ids[label] = (account.get("deviceId") or "").strip()
 
-    # gl_user_id 风控头可选：能拿到 accountId 就带上，拿不到不影响流程。
-    account_ids = {}
-    try:
-        from lynkco_login import get_user_info
-        for label, token in tokens.items():
-            if device_ids[label]:
-                info = get_user_info(token, device_ids[label])
-                account_ids[label] = info.get("id")
-    except Exception as e:
-        print(f"[提示] 解析账号 accountId 失败（不影响主流程）: {e}")
+    clients = {
+        "A": LynkCoShareClient(tokens["A"], device_id=device_ids.get("A")),
+        "B": LynkCoShareClient(tokens["B"], device_id=device_ids.get("B")),
+    }
 
-    result = cross_share(
-        tokens["A"], tokens["B"],
-        account_id_a=account_ids.get("A"),
-        account_id_b=account_ids.get("B"),
-        device_id_a=device_ids.get("A"),
-        device_id_b=device_ids.get("B"),
-    )
-    if result.get("ok"):
-        print("\n互点分享：双向均成功！")
+    def _one_direction(sharer: str, visitor: str) -> dict:
+        """
+        sharer 出分享码并自上报激活（App 真实分享动作的两步），visitor 以 H5
+        匿名访客身份上报浏览（服务端只把 H5 通道的上报计为"被浏览"）。
+        注意 getShareCode/shareReporting 的 code=success 不代表成功，真实结果
+        在 data 字段（"上报成功"/"验证码过期"等）。
+        """
+        try:
+            latest = clients[sharer].get_latest_article()
+            article_id = latest.get("articleId") or DEFAULT_SHARE_ARTICLE_ID
+            code_info = clients[sharer].get_share_code(article_id=article_id)
+            share_code = code_info.get("data") or ""
+            if not isinstance(share_code, str) or len(share_code) < 32:
+                # 出码失败或触发风控（如 share.need.validate.check 要求极验）
+                raise RuntimeError(f"{sharer} getShareCode 未返回有效 shareCode: {code_info}")
+            activate = clients[sharer].share_reporting(share_code, business_no=article_id)
+            view = h5_report_view(share_code, business_no=article_id)
+            view_data = str(view.get("data") or "")
+            ok = view_data in ("上报成功",) or any(k in view_data for k in ("已",))
+            return {"ok": ok, "detail": {
+                "getShareCode": code_info, "activate": activate, "h5ViewReport": view,
+            }, "articleId": article_id}
+        except Exception as e:
+            return {"ok": False, "detail": {"error": str(e)}}
+
+    print("\n=== 互点浏览 · 访客浏览 A（主号）的分享 ===")
+    result = {"a_as_sharer": _one_direction("A", "B")}
+    print(json.dumps(mask_sensitive(result["a_as_sharer"]), ensure_ascii=False, indent=2))
+
+    print("\n=== 互点浏览 · 访客浏览 B（副号）的分享 ===")
+    result["b_as_sharer"] = _one_direction("B", "A")
+    print(json.dumps(mask_sensitive(result["b_as_sharer"]), ensure_ascii=False, indent=2))
+
+    result["ok"] = bool(result["a_as_sharer"].get("ok")) and bool(result["b_as_sharer"].get("ok"))
+    if result["ok"]:
+        print("\n互点浏览：双向均成功！")
     else:
-        print("\n互点分享：存在失败方向，详情见上方日志。")
+        print("\n互点浏览：存在失败方向，详情见上方日志。")
     return result
 
 
