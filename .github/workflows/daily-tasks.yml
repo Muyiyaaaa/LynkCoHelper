@@ -93,9 +93,14 @@ jobs:
         GH_TOKEN: ${{ github.token }}
         LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
       run: |
-        # 任务即使失败，只要续期成功过 env.json 就有新值；持久化失败不阻断
-        if ! python LynkCoHelper/tools/refresh_state.py persist LynkCoHelper/env.json new-rt.enc; then
+        # 任务即使失败，只要续期成功过 env.json 就有新值；持久化失败不阻断。
+        # 第4个参数传已有密文：解密比对明文，未轮换则跳过（密文 nonce 随机，不能按字节比）。
+        if ! python LynkCoHelper/tools/refresh_state.py persist LynkCoHelper/env.json new-rt.enc LynkCoHelper/.rt-state.enc; then
           echo "[persist] 本次未产生新 refreshToken，跳过"
+          exit 0
+        fi
+        if [ ! -s new-rt.enc ]; then
+          echo "[persist] 轮换值未变化，跳过提交"
           exit 0
         fi
         if cmp -s new-rt.enc LynkCoHelper/.rt-state.enc; then

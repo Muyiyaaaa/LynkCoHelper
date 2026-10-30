@@ -107,13 +107,34 @@ def main() -> None:
 
     elif cmd == "persist":
         if len(sys.argv) < 4:
-            raise SystemExit("用法: refresh_state.py persist <env.json路径> <输出密文文件>")
+            raise SystemExit("用法: refresh_state.py persist <env.json路径> <输出密文文件> [已有密文文件]")
         env_path, out_path = sys.argv[2], sys.argv[3]
+        existing_path = sys.argv[4] if len(sys.argv) > 4 else None
         if not os.path.exists(env_path):
             raise SystemExit(f"[refresh_state] {env_path} 不存在，本次未轮换，跳过持久化")
         accounts = _extract_accounts(env_path)
         if not accounts:
             raise SystemExit("[refresh_state] env.json 中无 refreshToken，跳过持久化")
+
+        # 密文每次 nonce 随机，无法按字节比较"是否轮换"；解密已有密文比对明文。
+        if existing_path and os.path.exists(existing_path):
+            try:
+                with open(existing_path, "r", encoding="ascii") as f:
+                    old_plain = _decrypt(f.read())
+                try:
+                    old_accounts = json.loads(old_plain).get("accounts") or []
+                    old_keys = [(a.get("name"), a.get("refreshToken")) for a in old_accounts
+                                if isinstance(a, dict)]
+                except Exception:
+                    # 旧版单账号格式：裸字符串，等价于"只有主号一个账号"
+                    old_keys = [("主号", old_plain)] if old_plain else []
+                new_keys = [(a["name"], a["refreshToken"]) for a in accounts]
+                if old_keys == new_keys:
+                    print("[refresh_state] 轮换值未变化，跳过持久化")
+                    return
+            except Exception:
+                pass  # 解密失败（密钥变更等）→ 按有变化处理，写入新密文
+
         payload = json.dumps({"accounts": accounts}, ensure_ascii=False)
         with open(out_path, "w", encoding="ascii") as f:
             f.write(_encrypt(payload))
