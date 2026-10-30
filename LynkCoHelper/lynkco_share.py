@@ -83,10 +83,13 @@ def _find_article(value) -> dict:
 
 
 class LynkCoShareClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, device_id: str = None):
         if not token:
             raise ValueError("token 不能为空")
         self.token = token if token.startswith("bearer") else f"bearer{token}"
+        # 多账号场景必须带发起账号自己的 deviceId；缺省时 build_native_app_headers
+        # 会兜底到主号设备号，token/设备不一致会触发风控（check/report 报"网络开小差"）
+        self.device_id = (device_id or "").strip() or None
         self.session = requests.Session()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
@@ -107,7 +110,7 @@ class LynkCoShareClient:
                 ),
                 "ca_version": "1",
                 "x-requiretoken": "false",
-                **build_native_app_headers(token=self.token),
+                **build_native_app_headers(device_id=self.device_id, token=self.token),
                 # 分享上报仍要求 H5 落地页 Origin；这不是 H5 签名。
                 "Origin": "https://h5.lynkco.cn",
                 "Referer": "https://h5.lynkco.cn/",
@@ -141,7 +144,7 @@ class LynkCoShareClient:
                 ),
                 "ca_version": "1",
                 "appversion": APP_VERSION,
-                **build_native_app_headers(token=self.token),
+                **build_native_app_headers(device_id=self.device_id, token=self.token),
                 **extra,
             },
             **kwargs,
@@ -198,7 +201,7 @@ class LynkCoShareClient:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        sweet_security_info = build_ios_security_info()
+        sweet_security_info = build_ios_security_info(device_id=self.device_id)
         extra_headers = {
             "risk_type": "1",
             "risk_request_info": risk_request_info,
@@ -360,7 +363,8 @@ def _run_three_step_as_visitor(client: LynkCoShareClient, content_id: str,
 def cross_share(token_a: str, token_b: str,
                 client_a: LynkCoShareClient = None,
                 client_b: LynkCoShareClient = None,
-                account_id_a: str = None, account_id_b: str = None) -> dict:
+                account_id_a: str = None, account_id_b: str = None,
+                device_id_a: str = None, device_id_b: str = None) -> dict:
     """
     双账号互点分享：每个账号各自 getShareCode 出一次分享，由另一账号以访客身份
     走完整三步法上报，从而让两个账号各获得一次"被点击"加分（在单账号自分享
@@ -371,8 +375,8 @@ def cross_share(token_a: str, token_b: str,
         b_as_sharer = A 点开 B 的链接后 B 号的加分结果。
     任一步骤失败不影响另一方向继续执行。
     """
-    client_a = client_a or LynkCoShareClient(token_a)
-    client_b = client_b or LynkCoShareClient(token_b)
+    client_a = client_a or LynkCoShareClient(token_a, device_id=device_id_a)
+    client_b = client_b or LynkCoShareClient(token_b, device_id=device_id_b)
     result = {"ok": False, "a_as_sharer": None, "b_as_sharer": None}
 
     # 方向一：A 分享 -> B 点击 -> A 加分
@@ -443,6 +447,8 @@ def run_cross_share_for_accounts(accounts: list) -> dict:
         tokens["A"], tokens["B"],
         account_id_a=account_ids.get("A"),
         account_id_b=account_ids.get("B"),
+        device_id_a=device_ids.get("A"),
+        device_id_b=device_ids.get("B"),
     )
     if result.get("ok"):
         print("\n互点分享：双向均成功！")

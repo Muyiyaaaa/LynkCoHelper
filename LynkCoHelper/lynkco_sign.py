@@ -38,11 +38,13 @@ EP_CONTINUE_DAYS = "/up/api/v1/userReward/getContinueDaysAndSignCard"
 
 
 class LynkCoSignClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, device_id: str = None):
         if not token:
             raise ValueError("token 不能为空")
         # 领克接口的 token 头需要 "bearer" 前缀且中间无空格，若外部传入时已带前缀则不重复添加
         self.token = token if token.startswith("bearer") else f"bearer{token}"
+        # 多账号场景带发起账号自己的 deviceId，避免兜底到主号设备号造成 token/设备不一致
+        self.device_id = (device_id or "").strip() or None
         self.session = requests.Session()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
@@ -58,7 +60,7 @@ class LynkCoSignClient:
                 ),
                 "ca_version": "1",
                 "x-requiretoken": "false",
-                **build_native_app_headers(),
+                **build_native_app_headers(device_id=self.device_id),
                 **extra_headers,
             },
             **kwargs,
@@ -87,7 +89,7 @@ class LynkCoSignClient:
                 ),
                 "ca_version": "1",
                 "x-requiretoken": "false",
-                **build_native_app_headers(),
+                **build_native_app_headers(device_id=self.device_id),
                 **extra_headers,
             },
             data=body,

@@ -90,12 +90,16 @@ def summarize_point_tasks(data: dict) -> list:
     return rows
 
 
-def run_daily_tasks(token: str, do_share: bool = True, do_cross_share: bool = True) -> dict:
+def run_daily_tasks(token: str, do_share: bool = True, do_cross_share: bool = True,
+                    device_id: str = None) -> dict:
     """
     编排执行一次完整的"签到 + 分享（+ 多账号互点）"流程，返回汇总结果字典：
     {"energy_before", "day_info", "already_signed", "sign_result", "continue_info",
      "share_result", "cross_share", "milestones", "energy_after"}
     （已签到/do_share=False/do_cross_share 跳过时对应字段为 None）。
+
+    device_id：发起账号自己的设备号，多账号时必须传，避免请求头兜底到主号
+    设备号造成 token/设备不一致触发风控。
 
     do_share 默认 True，供需要在测试/脚本中跳过分享的调用方使用；
     正式入口 run_and_notify() 始终以 do_share=True 调用。
@@ -104,7 +108,7 @@ def run_daily_tasks(token: str, do_share: bool = True, do_cross_share: bool = Tr
     """
     result = {}
 
-    sign_client = LynkCoSignClient(token)
+    sign_client = LynkCoSignClient(token, device_id=device_id)
 
     result["energy_before"] = get_my_energy(sign_client)
 
@@ -130,7 +134,7 @@ def run_daily_tasks(token: str, do_share: bool = True, do_cross_share: bool = Tr
         result["milestones"] = None
 
     if do_share:
-        share_client = LynkCoShareClient(token)
+        share_client = LynkCoShareClient(token, device_id=device_id)
         try:
             result["share_result"] = share_client.do_share()
         except Exception as e:
@@ -220,7 +224,8 @@ def run_and_notify() -> dict:
             results.append({"account": label, "error": str(e)})
             continue
         print(f"\n=== [{label}] 执行每日任务（签到+分享）===")
-        result = run_daily_tasks(token, do_share=True, do_cross_share=False)
+        result = run_daily_tasks(token, do_share=True, do_cross_share=False,
+                                 device_id=(account.get("deviceId") or "").strip() or None)
         result["account"] = label
         print(json.dumps(mask_sensitive(result), ensure_ascii=False, indent=2))
         results.append(result)

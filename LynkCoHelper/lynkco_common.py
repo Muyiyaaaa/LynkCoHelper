@@ -133,9 +133,10 @@ def build_native_app_headers(device_id: str = None, token: str = None,
     return headers
 
 
-def build_ios_security_info() -> str:
+def build_ios_security_info(device_id: str = None) -> str:
     """Build the non-secret iOS risk metadata used by the share endpoint."""
-    device_id = _build_native_device_headers()["gl_dev_id"]
+    # 多账号场景必须传发起请求账号自己的 deviceId，否则 token 与设备头不一致会触发风控
+    device_id = device_id or _build_native_device_headers()["gl_dev_id"]
     return json.dumps({
         "osVersion": IOS_OS_VERSION,
         "platform": "ios",
