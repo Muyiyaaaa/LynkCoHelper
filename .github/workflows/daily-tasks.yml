@@ -54,10 +54,22 @@ jobs:
           echo "[restore] 仓库无密文文件（首次运行），将使用 Secrets 种子"
         fi
 
+    - name: 组装 env.json（多账号凭据 + 轮换链回填）
+      env:
+        LYNKCO_USERS_JSON: ${{ secrets.LYNKCO_USERS_JSON }}
+        LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+        LYNKCO_BARK_KEY: ${{ secrets.LYNKCO_BARK_KEY }}
+      run: |
+        set -e
+        # LYNKCO_USERS_JSON 为各账号冷启动凭据（[{name, refreshToken, deviceId}, ...]）；
+        # 未配置时回退单账号 Secrets（LYNKCO_REFRESH_TOKEN/DISABLED 见下步）。
+        # .rt_restored 存在则把轮换后的最新 refreshToken 按账号名回填。
+        python LynkCoHelper/tools/bootstrap_env.py LynkCoHelper/env.json .rt_restored
+
     - name: Run sign-in and notify
       env:
-        # refreshToken 自动续期获取 token，详见 lynkco_login.load_token()。
-        # 优先使用上一步恢复的最新轮换值；无恢复文件时回退到 Secrets 种子。
+        # env.json 已由上一步组装（多账号），以下单账号 Secrets 仅作
+        # LYNKCO_USERS_JSON 未配置时的兜底种子，双账号场景不参与取值。
         LYNKCO_REFRESH_TOKEN: ${{ secrets.LYNKCO_REFRESH_TOKEN }}
         LYNKCO_DEVICE_ID: ${{ secrets.LYNKCO_DEVICE_ID }}
         # Bark 推送 key，详见 lynkco_notify.py
@@ -72,12 +84,7 @@ jobs:
         LYNKCO_TIMEOUT: ${{ vars.LYNKCO_TIMEOUT || '30' }}
         LYNKCO_RETRIES: ${{ vars.LYNKCO_RETRIES || '2' }}
       run: |
-        if [ -s .rt_restored ]; then
-          export LYNKCO_REFRESH_TOKEN="$(cat .rt_restored)"
-          echo "[run] 使用仓库密文恢复的最新 refreshToken"
-        else
-          echo "[run] 使用 Secrets 种子 refreshToken"
-        fi
+        # env.json 已由 bootstrap_env.py 组装完成（含轮换链回填），直接运行
         python ./LynkCoHelper/lynkco_daily_tasks.py
 
     - name: 持久化轮换后的 refreshToken 到仓库密文

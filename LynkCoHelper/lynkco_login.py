@@ -424,6 +424,94 @@ def load_token() -> str:
     )
 
 
+# ------------------------- 多账号支持（双账号互点分享等场景） -------------------------
+
+def load_accounts() -> list:
+    """
+    返回账号凭据列表，供多账号任务（如互点分享）使用：
+        - env.json 存在非空 users 数组时按其返回 [{"name", "token", "refreshToken",
+          "deviceId", "tokenExpireAt"}, ...]；
+        - 否则把单 user 节包装成单元素列表（name 默认 "主号"），行为向后兼容。
+    每个元素额外带 "_multi" 标记与 "_index"（users 数组下标；单账号为 -1），
+    供 load_token_for() 续期后按原位置回写缓存。
+    """
+    data = load_env_data()
+    users = data.get("users") or []
+    if users:
+        accounts = []
+        for index, entry in enumerate(users):
+            if not isinstance(entry, dict):
+                continue
+            account = dict(entry)
+            account.setdefault("name", f"账号{index + 1}")
+            account["_multi"] = True
+            account["_index"] = index
+            accounts.append(account)
+        if accounts:
+            return accounts
+    single = dict(data.get("user") or {})
+    single.setdefault("name", "主号")
+    single["_multi"] = False
+    single["_index"] = -1
+    return [single]
+
+
+def _save_account_fields(account: dict, fields: dict) -> None:
+    """把 token 缓存字段回写到 env.json 的原账号位置（users[i] 或单 user 节）。"""
+    from lynkco_common import read_env_file_raw, save_env_data
+    raw = read_env_file_raw()
+    if account.get("_multi"):
+        users = raw.get("users")
+        if isinstance(users, list) and 0 <= account["_index"] < len(users) and isinstance(users[account["_index"]], dict):
+            users[account["_index"]].update(fields)
+    else:
+        raw.setdefault("user", {})
+        if isinstance(raw["user"], dict):
+            raw["user"].update(fields)
+    save_env_data(raw)
+
+
+def load_token_for(account: dict, label: str = None) -> str:
+    """
+    针对指定账号（load_accounts() 返回的元素）执行与 load_token() 相同的
+    优先级策略取 token；refreshToken 续期成功后把新 token 回写到该账号原位置，
+    不会污染单账号 user 节。label 用于日志区分账号，默认取 account["name"]。
+    """
+    label = label or account.get("name") or "账号"
+
+    cached = _cached_token_valid(account)
+    if cached:
+        return cached
+
+    refresh_token_value = (env_value("LYNKCO_REFRESH_TOKEN") or account.get("refreshToken") or "").strip()
+    device_id = (env_value("LYNKCO_DEVICE_ID") or account.get("deviceId") or "").strip()
+    # 多账号场景下全局环境变量只能服务一个账号；仅单账号时才允许环境变量兜底。
+    if account.get("_multi") and env_value("LYNKCO_DEVICE_ID") and not account.get("deviceId"):
+        device_id = ""
+
+    if refresh_token_value and device_id:
+        try:
+            refreshed = refresh_token(refresh_token_value, device_id)
+            print(f"[信息] [{label}] 已使用 refreshToken 自动续期获取最新 token。")
+            fields = {"token": refreshed["token"]}
+            if refreshed.get("refreshToken"):
+                fields["refreshToken"] = refreshed["refreshToken"]
+            if refreshed.get("expireAt"):
+                fields["tokenExpireAt"] = refreshed["expireAt"]
+            if device_id and not account.get("deviceId"):
+                fields["deviceId"] = device_id
+            _save_account_fields(account, fields)
+            return refreshed["token"]
+        except Exception as e:
+            print(f"[警告] [{label}] refreshToken 自动续期失败: {e}，将退回使用静态 token。")
+
+    token = (account.get("token") or "").strip()
+    if token:
+        return token
+
+    raise RuntimeError(f"[{label}] 未找到有效的 token，请在 env.json users 数组对应账号中配置 refreshToken+deviceId 或 token。")
+
+
 # ------------------------- 极验 GT4 本地滑块辅助页面 -------------------------
 #
 # 极验人机挑战无法自动化，本地生成一个 HTML 页面加载极验官方 GT4 Web SDK，

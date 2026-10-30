@@ -157,12 +157,41 @@ def build_markdown_report(result: dict) -> str:
             detail = share_result.get("detail") or {}
             tasks.append(f"🔗 **分享** 失败（{detail.get('message', '详情见日志')}）")
 
+    # --- 互点分享（多账号）---
+    cross = result.get("cross_share")
+    if cross is not None and not cross.get("skipped"):
+        a_ok = bool((cross.get("a_as_sharer") or {}).get("ok"))
+        b_ok = bool((cross.get("b_as_sharer") or {}).get("ok"))
+        mark = lambda ok: "✅" if ok else "❌"  # noqa: E731
+        tasks.append(f"🔁 **互点** {mark(a_ok)}A↔{mark(b_ok)}B")
+
     # ============ 提醒引用块 ============
     if share_title:
         minor.append(f"📰 《{share_title}》")
-    expire = _extract_expire(result.get("energy_after") or {})
+    milestones = result.get("milestones") or {}
+    achieved = [str(m["days"]) for m in milestones.get("milestones", []) if m.get("achieved")]
+    if achieved:
+        minor.append(f"🎯 里程碑已达成：{', '.join(achieved)} 天")
+    # 积分任务清单概况（官方 22 项任务，按目录统计）
+    tasks_list = result.get("point_tasks") or []
+    if tasks_list:
+        from collections import Counter
+        by_cat = Counter(t.get("catalogue") or "任务" for t in tasks_list)
+        parts = " / ".join(f"{name} {count}" for name, count in by_cat.items())
+        minor.append(f"📋 积分任务 {len(tasks_list)} 项（{parts}）")
+    # 积分过期：优先用 /app/energy/expire 接口精确值，回退 myEnergy.expirePoint
+    expire = 0
+    expire_data = result.get("energy_expire") or {}
+    try:
+        expire = int(expire_data.get("point") or 0)
+    except (TypeError, ValueError):
+        expire = 0
+    if expire <= 0:
+        expire = _extract_expire(result.get("energy_after") or {})
     if expire > 0:
-        minor.append(f"⏰ {expire} 枚 Co积分即将过期，记得消耗")
+        expire_date = (expire_data.get("expriedDate") or "").split(" ")[0]
+        suffix = f"（{expire_date} 到期）" if expire_date else ""
+        minor.append(f"⏰ {expire} 枚 Co积分即将过期{suffix}，记得消耗")
     if sign_card is not None:
         minor.append(f"🎫 签到卡 {sign_card} 张")
     if income not in ("?", ""):

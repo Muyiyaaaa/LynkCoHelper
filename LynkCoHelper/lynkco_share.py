@@ -24,6 +24,8 @@ from lynkco_common import (
     build_ios_security_info,
     build_ios_signature,
     build_native_app_headers,
+    env_value,
+    get_extra_endpoint,
     mask_sensitive,
     request_with_retry,
 )
@@ -332,6 +334,156 @@ def run_auto_share(token: str) -> dict:
     except Exception as e:
         print(f"[警告] 分享任务执行失败: {e}")
         return {"ok": False, "detail": {"message": str(e)}}
+
+
+# ------------------------- 双账号互点分享 -------------------------
+
+def _run_three_step_as_visitor(client: LynkCoShareClient, content_id: str,
+                               share_code: str) -> dict:
+    """以"点开分享链接的访客"身份走完整三步法（lookup -> check -> report），为分享人加分。"""
+    detail = {}
+    try:
+        detail["lookup"] = client.share_lookup(share_code)
+        detail["check"] = client.share_check(content_id, share_code)
+        detail["report"] = client.share_report(content_id, share_code)
+        report = detail["report"] or {}
+        ok = str(report.get("code")) in ("200", "success")
+        msg = str(report.get("message") or "")
+        if not ok and any(k in msg for k in ("已分享", "已领取", "今日已", "已结束")):
+            ok = True
+        return {"ok": ok, "detail": detail}
+    except Exception as e:
+        detail["error"] = str(e)
+        return {"ok": False, "detail": detail}
+
+
+def cross_share(token_a: str, token_b: str,
+                client_a: LynkCoShareClient = None,
+                client_b: LynkCoShareClient = None,
+                account_id_a: str = None, account_id_b: str = None) -> dict:
+    """
+    双账号互点分享：每个账号各自 getShareCode 出一次分享，由另一账号以访客身份
+    走完整三步法上报，从而让两个账号各获得一次"被点击"加分（在单账号自分享
+    +5 之外额外增加，受服务端每日上限约束）。
+
+    返回 {"ok", "a_as_sharer", "b_as_sharer"}：
+        a_as_sharer = B 点开 A 的链接后 A 号的加分结果；
+        b_as_sharer = A 点开 B 的链接后 B 号的加分结果。
+    任一步骤失败不影响另一方向继续执行。
+    """
+    client_a = client_a or LynkCoShareClient(token_a)
+    client_b = client_b or LynkCoShareClient(token_b)
+    result = {"ok": False, "a_as_sharer": None, "b_as_sharer": None}
+
+    # 方向一：A 分享 -> B 点击 -> A 加分
+    print("\n=== 互点分享 · B 访客点击 A 的分享 ===")
+    try:
+        latest_a = client_a.get_latest_article()
+        article_a = latest_a.get("articleId") or DEFAULT_SHARE_ARTICLE_ID
+        code_info_a = client_a.get_share_code(article_id=article_a, account_id=account_id_a)
+        share_code_a = code_info_a.get("data") or ""
+        if not share_code_a:
+            raise RuntimeError(f"A getShareCode 未返回 shareCode: {code_info_a}")
+        result["a_as_sharer"] = _run_three_step_as_visitor(client_b, article_a, share_code_a)
+        result["a_as_sharer"]["articleId"] = article_a
+        print(json.dumps(mask_sensitive(result["a_as_sharer"]), ensure_ascii=False, indent=2))
+    except Exception as e:
+        result["a_as_sharer"] = {"ok": False, "detail": {"message": str(e)}}
+        print(f"[警告] 方向一（A 分享/B 点击）失败: {e}")
+
+    # 方向二：B 分享 -> A 点击 -> B 加分
+    print("\n=== 互点分享 · A 访客点击 B 的分享 ===")
+    try:
+        latest_b = client_b.get_latest_article()
+        article_b = latest_b.get("articleId") or DEFAULT_SHARE_ARTICLE_ID
+        code_info_b = client_b.get_share_code(article_id=article_b, account_id=account_id_b)
+        share_code_b = code_info_b.get("data") or ""
+        if not share_code_b:
+            raise RuntimeError(f"B getShareCode 未返回 shareCode: {code_info_b}")
+        result["b_as_sharer"] = _run_three_step_as_visitor(client_a, article_b, share_code_b)
+        result["b_as_sharer"]["articleId"] = article_b
+        print(json.dumps(mask_sensitive(result["b_as_sharer"]), ensure_ascii=False, indent=2))
+    except Exception as e:
+        result["b_as_sharer"] = {"ok": False, "detail": {"message": str(e)}}
+        print(f"[警告] 方向二（B 分享/A 点击）失败: {e}")
+
+    result["ok"] = bool((result["a_as_sharer"] or {}).get("ok")) and bool((result["b_as_sharer"] or {}).get("ok"))
+    return result
+
+
+def run_cross_share_for_accounts(accounts: list) -> dict:
+    """
+    供 lynkco_daily_tasks.py 调用：取 load_accounts() 返回的前两个账号执行互点分享。
+    每个账号独立走 load_token_for() 续期；账号不足 2 个时返回 {"skipped": True}。
+    """
+    if not accounts or len(accounts) < 2:
+        print("[提示] 账号数量少于 2（需在 env.json 配置 users 数组），跳过互点分享。")
+        return {"ok": False, "skipped": True, "reason": "需要至少 2 个账号"}
+    from lynkco_login import load_token_for
+
+    tokens = {}
+    device_ids = {}
+    for index, label in ((0, "A"), (1, "B")):
+        account = accounts[index]
+        tokens[label] = load_token_for(account, label=account.get("name"))
+        device_ids[label] = (account.get("deviceId") or "").strip()
+
+    # gl_user_id 风控头可选：能拿到 accountId 就带上，拿不到不影响流程。
+    account_ids = {}
+    try:
+        from lynkco_login import get_user_info
+        for label, token in tokens.items():
+            if device_ids[label]:
+                info = get_user_info(token, device_ids[label])
+                account_ids[label] = info.get("id")
+    except Exception as e:
+        print(f"[提示] 解析账号 accountId 失败（不影响主流程）: {e}")
+
+    result = cross_share(
+        tokens["A"], tokens["B"],
+        account_id_a=account_ids.get("A"),
+        account_id_b=account_ids.get("B"),
+    )
+    if result.get("ok"):
+        print("\n互点分享：双向均成功！")
+    else:
+        print("\n互点分享：存在失败方向，详情见上方日志。")
+    return result
+
+
+# ------------------------- 点赞（真机抓包确认端点） -------------------------
+
+# 抓包确认：POST /app/explore/home-page/article/operation/agree
+#   query: itemId=<articleId>&isForward=false|true&type=ThumbCount
+#   body : {"path":"pages/exploration/article/index.js?pageCode=LYNKCO_APP_1019&id=<articleId>"}
+#   isForward=false 为点赞、true 为取消点赞；响应 {"code":"success","data":true}
+EP_LIKE_AGREE = "/app/explore/home-page/article/operation/agree"
+LIKE_ORIGIN = "https://app.lynkco.com"
+
+
+def like_article(client: LynkCoShareClient, article_id: str, like: bool = True) -> dict:
+    """给探索广场文章点赞（like=True）或取消点赞（like=False）。"""
+    body = {"path": f"pages/exploration/article/index.js?pageCode=LYNKCO_APP_1019&id={article_id}"}
+    params = {
+        "itemId": article_id,
+        "isForward": "false" if like else "true",
+        "type": "ThumbCount",
+    }
+    resp = client._request(
+        "POST", EP_LIKE_AGREE, params=params, json=body,
+        extra_headers={"Origin": LIKE_ORIGIN, "Referer": LIKE_ORIGIN + "/"},
+    )
+    result = resp.json()
+    ok = str(result.get("code")) in ("200", "success") or bool(result.get("success"))
+    print(f"[信息] 点赞 article={article_id} like={like} -> ok={ok}")
+    return {"ok": ok, "liked": like, "articleId": article_id, "detail": result}
+
+
+def like_latest_article(client: LynkCoShareClient) -> dict:
+    """取探索广场最新文章点赞一次（成功后不取消，保留互动痕迹）。"""
+    latest = client.get_latest_article()
+    article_id = latest.get("articleId") or DEFAULT_SHARE_ARTICLE_ID
+    return like_article(client, article_id)
 
 
 def main():

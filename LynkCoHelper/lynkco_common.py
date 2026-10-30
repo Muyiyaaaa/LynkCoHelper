@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import uuid
 
@@ -304,19 +305,61 @@ def build_ios_signature(method: str, path: str, token: str = "", query: dict = N
 
 
 def load_env_data() -> dict:
-    """读取 env.json，返回标准配置节；缺失节使用空 dict。"""
+    """读取 env.json，返回标准配置节；缺失节使用空 dict/空列表。"""
     if not os.path.exists(ENV_FILE):
-        return {"user": {}, "secrets": {}, "notify": {}, "ai": {}}
+        return {"user": {}, "users": [], "secrets": {}, "notify": {}, "ai": {}, "extraEndpoints": {}}
     with open(ENV_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, dict):
-        return {"user": {}, "secrets": {}, "notify": {}, "ai": {}}
+        return {"user": {}, "users": [], "secrets": {}, "notify": {}, "ai": {}, "extraEndpoints": {}}
+    users = data.get("users")
     return {
         "user": data.get("user") or {},
+        # 多账号（可选）：[{"name": "主号", "refreshToken": "", "deviceId": ""}, ...]。
+        # 存在且非空时优先于单 user 节，供双账号互点分享等场景使用。
+        "users": users if isinstance(users, list) else [],
         "secrets": data.get("secrets") or {},
         "notify": data.get("notify") or {},
         "ai": data.get("ai") or {},
+        # 可选扩展端点：{"rewardReceive": "/up/api/v1/userReward/receive", ...}。
+        # 未在代码中硬编码抓包确认的写操作路径，统一经由此处/同名环境变量注入。
+        "extraEndpoints": data.get("extraEndpoints") or {},
     }
+
+
+def save_env_data(raw: dict) -> None:
+    """把完整配置结构整体写回 env.json（保留未知字段）。写失败静默忽略，同 save_env_fields。"""
+    try:
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def read_env_file_raw() -> dict:
+    """读取 env.json 原始 dict（不做节规范化），供多账号按索引回写字段使用。"""
+    if not os.path.exists(ENV_FILE):
+        return {}
+    try:
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_extra_endpoint(name: str) -> str:
+    """
+    读取一个可选扩展端点路径（如 /up/api/v1/userReward/receive）。
+
+    优先级：环境变量 LYNKCO_EP_<SCREAMING_SNAKE(name)> > env.json["extraEndpoints"][name]。
+    例：name="signRepair" 对应环境变量 LYNKCO_EP_SIGN_REPAIR。
+    返回空字符串表示未配置（调用方应安全跳过该能力，不得猜测默认路径）。
+    适用于接口路径尚未抓包确认、但签名体系已就绪的写操作（奖励领取/补签/点赞等）。
+    """
+    env_name = re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper()
+    value = env_value(f"LYNKCO_EP_{env_name}") or load_env_data().get("extraEndpoints", {}).get(name)
+    return str(value).strip() if value else ""
 
 
 def save_env_fields(fields: dict, section: str = "user") -> None:
