@@ -547,19 +547,25 @@ def run_cross_share_for_accounts(accounts: list) -> dict:
         except Exception as e:
             return {"ok": False, "detail": {"error": str(e)}}
 
-    print("\n=== 互点浏览 · 访客浏览 A（主号）的分享 ===")
-    result = {"a_as_sharer": _one_direction("A", "B")}
-    print(json.dumps(mask_sensitive(result["a_as_sharer"]), ensure_ascii=False, indent=2))
+    # 服务端疑似按 IP 对"浏览"做每日去重（2026-10-31 实测：同 IP 同日先报的方向
+    # 成功计入、后报的方向被拒）。互点双方共用本机 IP，每天只有一个方向能拿到
+    # 浏览加分 → 按日期奇偶轮换先报方向，两个账号隔天轮流 +5，长期公平。
+    order = ("A", "B") if time.localtime().tm_yday % 2 else ("B", "A")
+    keys = {"A": "a_as_sharer", "B": "b_as_sharer"}
 
-    print("\n=== 互点浏览 · 访客浏览 B（副号）的分享 ===")
-    result["b_as_sharer"] = _one_direction("B", "A")
-    print(json.dumps(mask_sensitive(result["b_as_sharer"]), ensure_ascii=False, indent=2))
+    result = {}
+    for sharer in order:
+        visitor = "B" if sharer == "A" else "A"
+        print(f"\n=== 互点浏览 · 访客({accounts[0 if visitor == 'A' else 1].get('name')})浏览 {sharer}（{accounts[0 if sharer == 'A' else 1].get('name')}）的分享 ===")
+        result[keys[sharer]] = _one_direction(sharer, visitor)
+        print(json.dumps(mask_sensitive(result[keys[sharer]]), ensure_ascii=False, indent=2))
 
     result["ok"] = bool(result["a_as_sharer"].get("ok")) and bool(result["b_as_sharer"].get("ok"))
     if result["ok"]:
         print("\n互点浏览：双向均成功！")
     else:
-        print("\n互点浏览：存在失败方向，详情见上方日志。")
+        print("\n互点浏览：存在失败方向（同 IP 每日浏览去重时属预期，隔天轮换补偿），详情见上方日志。")
+    return result
     return result
 
 
